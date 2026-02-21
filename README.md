@@ -1,4 +1,3 @@
-# AI SQL Engine
 
 API que recebe perguntas em linguagem natural, gera SQL via LLM local (Ollama) e executa no PostgreSQL — tudo via Docker, sem dependência de serviços externos.
 
@@ -319,5 +318,3 @@ SELECT client_addr, state FROM pg_stat_replication;
 - **PostgreSQL 16** — banco de dados
 - **Redis 7** — cache de respostas
 - **Docker Compose** — orquestração
-#   a i - e n g i n e  
- 
