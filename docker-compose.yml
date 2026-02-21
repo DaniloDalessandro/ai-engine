@@ -78,7 +78,7 @@ services:
 
   api:
     build:
-      context: ./api
+      context: .
     image: danilodalessandro/ai-sql-engine:latest
     container_name: ai-api
     restart: unless-stopped
