@@ -106,6 +106,7 @@ services:
       MAX_ROWS: ${MAX_ROWS:-100}
       MAX_HISTORY: ${MAX_HISTORY:-5}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      NL_TIMEOUT: ${NL_TIMEOUT:-60}
     ports:
       - "8080:8000"
     networks:

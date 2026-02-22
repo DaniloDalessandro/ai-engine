@@ -4,6 +4,7 @@ import json
 import secrets
 import logging
 import sqlparse
+import threading
 from contextlib import asynccontextmanager
 from typing import Optional
 
@@ -46,6 +47,7 @@ RATE_LIMIT        = int(os.getenv("RATE_LIMIT", "5"))
 CACHE_TTL         = int(os.getenv("CACHE_TTL", "3600"))
 MAX_ROWS          = int(os.getenv("MAX_ROWS", "100"))
 MAX_HISTORY       = int(os.getenv("MAX_HISTORY", "5"))
+NL_TIMEOUT        = int(os.getenv("NL_TIMEOUT", "60"))
 
 if not POSTGRES_PASSWORD or not API_KEY:
     raise RuntimeError("POSTGRES_PASSWORD e API_KEY são obrigatórios. Configure o arquivo .env.")
@@ -61,6 +63,7 @@ engine = None
 sql_chain = None
 nl_chain = None
 db_instance: SQLDatabase = None
+llm_lock = threading.Lock()  # garante 1 chamada ao Ollama por vez
 
 
 # -------------------------------
@@ -104,16 +107,56 @@ async def lifespan(app: FastAPI):
     else:
         logger.info(f"Tabelas disponíveis: {tables}")
 
-    llm = OllamaLLM(model=OLLAMA_MODEL, base_url=OLLAMA_BASE_URL)
-    sql_chain = create_sql_query_chain(llm, db_instance)
-
-    nl_prompt = PromptTemplate.from_template(
-        "Pergunta: {question}\n"
-        "SQL executado: {sql}\n"
-        "Resultado ({row_count} linhas): {result}\n\n"
-        "Responda a pergunta em português de forma clara e concisa, sem repetir o SQL."
+    llm = OllamaLLM(
+        model=OLLAMA_MODEL,
+        base_url=OLLAMA_BASE_URL,
+        num_predict=200,
+        temperature=0,
+        num_ctx=2048,
+        timeout=240,
     )
-    nl_chain = nl_prompt | llm | StrOutputParser()
+
+    sql_prompt = PromptTemplate.from_template(
+        "PostgreSQL expert. Respond with ONE SELECT only, no explanation, no markdown, no semicolon.\n\n"
+        "Schema:\n{table_info}\n\n"
+        "Column ownership (use ONLY these):\n"
+        "- clientes: id, nome, email, cidade, estado, criado_em\n"
+        "- produtos: id, nome, preco, estoque, categoria_id, ativo, criado_em\n"
+        "- categorias: id, nome\n"
+        "- pedidos: id, cliente_id, status, total, criado_em\n"
+        "- itens_pedido: id, pedido_id, produto_id, quantidade, preco_unitario\n\n"
+        "Relations:\n"
+        "- produtos.categoria_id = categorias.id\n"
+        "- pedidos.cliente_id = clientes.id\n"
+        "- itens_pedido.pedido_id = pedidos.id\n"
+        "- itens_pedido.produto_id = produtos.id\n\n"
+        "Examples:\n"
+        "Q: total de vendas por estado\n"
+        "A: SELECT c.estado, SUM(p.total) AS total_vendas FROM clientes c JOIN pedidos p ON c.id = p.cliente_id GROUP BY c.estado ORDER BY total_vendas DESC LIMIT 10\n\n"
+        "Q: 5 produtos mais vendidos\n"
+        "A: SELECT pr.nome, SUM(ip.quantidade) AS total FROM produtos pr JOIN itens_pedido ip ON pr.id = ip.produto_id GROUP BY pr.nome ORDER BY total DESC LIMIT 5\n\n"
+        "Q: clientes com mais pedidos\n"
+        "A: SELECT c.nome, COUNT(p.id) AS qtd FROM clientes c JOIN pedidos p ON c.id = p.cliente_id GROUP BY c.nome ORDER BY qtd DESC LIMIT 10\n\n"
+        "Q: faturamento por categoria\n"
+        "A: SELECT cat.nome, SUM(ip.quantidade * ip.preco_unitario) AS faturamento FROM categorias cat JOIN produtos pr ON cat.id = pr.categoria_id JOIN itens_pedido ip ON pr.id = ip.produto_id GROUP BY cat.nome ORDER BY faturamento DESC LIMIT 10\n\n"
+        "Rules: simple direct SELECT, no subqueries, no CTEs, no WITH clauses, no quoted identifiers, lowercase aliases only, LIMIT {top_k}.\n"
+        "Question: {input}\nSQL:"
+    )
+    sql_chain = create_sql_query_chain(llm, db_instance, prompt=sql_prompt)
+
+    nl_llm = OllamaLLM(
+        model=OLLAMA_MODEL,
+        base_url=OLLAMA_BASE_URL,
+        num_predict=80,
+        temperature=0,
+        num_ctx=512,
+        timeout=60,
+    )
+    nl_prompt = PromptTemplate.from_template(
+        "Dados: {result} ({row_count} linhas)\n"
+        "Responda em 1-2 frases em português: {question}"
+    )
+    nl_chain = nl_prompt | nl_llm | StrOutputParser()
 
     logger.info("Aplicação pronta.")
     yield
@@ -192,6 +235,8 @@ def validate_sql(sql: str):
 def clean_sql(raw: str) -> str:
     """Remove markdown e texto extra que o LLM pode gerar ao redor do SQL."""
     raw = raw.strip()
+
+    # Remove blocos de código markdown
     if "```" in raw:
         parts = raw.split("```")
         for part in parts:
@@ -199,18 +244,36 @@ def clean_sql(raw: str) -> str:
             if part.lower().startswith("sql"):
                 part = part[3:].strip()
             if part.lower().startswith("select"):
-                return part.strip()
+                raw = part.strip()
+                break
+
+    # Extrai apenas o primeiro SELECT, ignorando tudo após o primeiro ponto-e-vírgula
     lines = raw.splitlines()
     sql_lines = []
     collecting = False
     for line in lines:
-        if line.strip().lower().startswith("select"):
+        stripped = line.strip()
+        if not collecting and stripped.lower().startswith("select"):
             collecting = True
         if collecting:
+            # Para ao encontrar linha vazia após ter coletado SQL, ou linha que parece comentário/texto
+            if sql_lines and not stripped:
+                break
+            if stripped.startswith("--") and sql_lines:
+                break
             sql_lines.append(line)
-    if sql_lines:
-        return "\n".join(sql_lines).strip()
-    return raw
+
+    result = "\n".join(sql_lines).strip() if sql_lines else raw
+
+    # Remove ponto-e-vírgula e tudo que vier depois (segundo statement)
+    semi = result.find(";")
+    if semi != -1:
+        result = result[:semi].strip()
+
+    # Remove aspas duplas de aliases (causam problemas no ORDER BY)
+    result = re.sub(r'AS\s+"([^"]+)"', lambda m: f'AS {m.group(1).lower()}', result)
+
+    return result
 
 
 def inject_limit(sql: str, limit: int) -> str:
@@ -339,14 +402,15 @@ def ask_db(data: Question, request: Request, api_key: str = Depends(verify_api_k
     # 2. Monta pergunta com histórico de conversa
     question_with_context = build_question_with_history(question, data.session_id)
 
-    # 3. Gera SQL com LangChain + retry
-    try:
-        raw_sql = invoke_sql_chain(question_with_context)
-        sql_query = clean_sql(raw_sql)
-        logger.debug(f"[{ip}] SQL gerado: {sql_query}")  # B2: DEBUG para não expor SQL em INFO
-    except Exception as e:
-        logger.error(f"[{ip}] Erro ao gerar SQL após retries: {e}")
-        raise HTTPException(status_code=500, detail=f"Erro ao gerar SQL: {e}")
+    # 3. Gera SQL com LangChain (lock garante 1 chamada ao Ollama por vez)
+    with llm_lock:
+        try:
+            raw_sql = invoke_sql_chain(question_with_context)
+            sql_query = clean_sql(raw_sql)
+            logger.debug(f"[{ip}] SQL gerado: {sql_query}")
+        except Exception as e:
+            logger.error(f"[{ip}] Erro ao gerar SQL após retries: {e}")
+            raise HTTPException(status_code=500, detail=f"Erro ao gerar SQL: {e}")
 
     # 4. Validação de segurança com sqlparse
     validate_sql(sql_query)
@@ -364,17 +428,18 @@ def ask_db(data: Question, request: Request, api_key: str = Depends(verify_api_k
         logger.error(f"[{ip}] Erro ao executar SQL: {e}")
         raise HTTPException(status_code=500, detail=f"Erro ao executar SQL: {e}")
 
-    # 7. Gera resposta em linguagem natural
-    try:
-        nl_answer = nl_chain.invoke({
-            "question": question,
-            "sql": sql_query,
-            "row_count": len(rows),
-            "result": str(rows[:5]),
-        })
-    except Exception as e:
-        logger.warning(f"[{ip}] Falha na resposta em linguagem natural: {e}")
-        nl_answer = None
+    # 7. Gera resposta em linguagem natural (NL_TIMEOUT=0 desabilita)
+    nl_answer = None
+    if NL_TIMEOUT > 0:
+        try:
+            nl_answer = nl_chain.invoke({
+                "question": question,
+                "sql": sql_query,
+                "row_count": len(rows),
+                "result": str(rows[:5]),
+            })
+        except Exception as e:
+            logger.warning(f"[{ip}] Falha na resposta em linguagem natural: {e}")
 
     # 8. Salva histórico da sessão (sem SQL — C4)
     if data.session_id:
