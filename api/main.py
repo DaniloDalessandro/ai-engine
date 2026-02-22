@@ -72,13 +72,17 @@ async def lifespan(app: FastAPI):
 
     logger.info("Iniciando conexões...")
 
-    # M8: timeouts nas conexões Redis
-    cache = redis_lib.Redis(
-        host=REDIS_HOST, port=REDIS_PORT, decode_responses=True,
-        socket_timeout=5, socket_connect_timeout=5,
-    )
-    cache.ping()
-    logger.info("Redis conectado.")
+    # M8: timeouts nas conexões Redis — falha silenciosa se indisponível
+    try:
+        cache = redis_lib.Redis(
+            host=REDIS_HOST, port=REDIS_PORT, decode_responses=True,
+            socket_timeout=5, socket_connect_timeout=5,
+        )
+        cache.ping()
+        logger.info("Redis conectado.")
+    except Exception as e:
+        logger.warning(f"Redis indisponível: {e}. Cache e rate limiting desativados.")
+        cache = None
 
     # M8: timeout na conexão PostgreSQL
     engine = create_engine(
@@ -148,6 +152,8 @@ def verify_api_key(x_api_key: str = Header(...)):
 # RATE LIMITING (via Redis)
 # -------------------------------
 def check_rate_limit(ip: str):
+    if cache is None:
+        return
     key = f"rate:{ip}"
     count = cache.incr(key)
     if count == 1:
@@ -219,11 +225,15 @@ def inject_limit(sql: str, limit: int) -> str:
 # HISTÓRICO DE CONVERSA
 # -------------------------------
 def get_history(session_id: str) -> list:
+    if cache is None:
+        return []
     raw = cache.lrange(f"history:{session_id}", 0, MAX_HISTORY - 1)
     return [json.loads(item) for item in raw]
 
 
 def save_history(session_id: str, question: str, row_count: int):
+    if cache is None:
+        return
     key = f"history:{session_id}"
     # C4: não persiste o SQL no histórico para evitar prompt injection
     entry = json.dumps({"q": question, "rows": row_count})
@@ -273,8 +283,9 @@ def health(response: Response):
         "ollama": False,
     }
     try:
-        cache.ping()
-        status["redis"] = True
+        if cache is not None:
+            cache.ping()
+            status["redis"] = True
     except Exception:
         pass
     try:
@@ -319,10 +330,11 @@ def ask_db(data: Question, request: Request, api_key: str = Depends(verify_api_k
     logger.info(f"[{ip}] Pergunta: {question}")
 
     # 1. Verifica cache
-    cached = cache.get(cache_key)
-    if cached:
-        logger.info(f"[{ip}] Cache hit.")
-        return {"response": json.loads(cached), "source": "cache"}
+    if cache is not None:
+        cached = cache.get(cache_key)
+        if cached:
+            logger.info(f"[{ip}] Cache hit.")
+            return {"response": json.loads(cached), "source": "cache"}
 
     # 2. Monta pergunta com histórico de conversa
     question_with_context = build_question_with_history(question, data.session_id)
@@ -375,6 +387,7 @@ def ask_db(data: Question, request: Request, api_key: str = Depends(verify_api_k
         "row_count": len(rows),
         "rows": rows,
     }
-    cache.setex(cache_key, CACHE_TTL, json.dumps(formatted, default=str))
+    if cache is not None:
+        cache.setex(cache_key, CACHE_TTL, json.dumps(formatted, default=str))
 
     return {"response": formatted, "source": "model"}
