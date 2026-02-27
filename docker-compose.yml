@@ -1,42 +1,26 @@
-# ================================================================
-# Funciona em qualquer lugar: local, EasyPanel, VPS, etc.
-#
-# VARIÁVEIS DE AMBIENTE:
-#   - Local: crie um arquivo .env na mesma pasta (veja .env.example)
-#     O Docker Compose lê o .env automaticamente
-#   - Produção: configure as variáveis no painel do servidor
-#
-# PARA BUILDAR E PUBLICAR A IMAGEM DA API:
-#   docker build -t danilodalessandro/ai-sql-engine:latest ./api
-#   docker push danilodalessandro/ai-sql-engine:latest
-# ================================================================
+version: "3.9"
 
 name: ai-sql-engine
 
 services:
 
-  postgres-replica:
+  postgres:
     image: postgres:16
-    container_name: pg-replica
+    container_name: ai-postgres
     restart: unless-stopped
     environment:
-      POSTGRES_USER: ${POSTGRES_USER}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
-      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ai_user
+      POSTGRES_PASSWORD: ai_password
+      POSTGRES_DB: ai_database
     volumes:
       - postgres_data:/var/lib/postgresql/data
     networks:
       - ai-network
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER"]
+      test: ["CMD-SHELL", "pg_isready -U ai_user -d ai_database"]
       interval: 10s
       timeout: 5s
       retries: 5
-    deploy:
-      resources:
-        limits:
-          cpus: '1.0'
-          memory: 512m
 
   redis:
     image: redis:7
@@ -49,73 +33,55 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-    deploy:
-      resources:
-        limits:
-          cpus: '0.5'
-          memory: 128m
 
   ollama:
-    image: ollama/ollama:0.3.12
+    image: ollama/ollama:latest
     container_name: ai-ollama
     restart: unless-stopped
+    ports:
+      - "11434:11434"
     volumes:
       - ollama_data:/root/.ollama
     networks:
       - ai-network
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
     healthcheck:
       test: ["CMD", "ollama", "list"]
       interval: 20s
       timeout: 10s
       retries: 5
-    ports:
-      - "127.0.0.1:11434:11434"
-    deploy:
-      resources:
-        limits:
-          cpus: '4.0'
-          memory: 8g
 
   api:
     build:
       context: ./api
-    image: danilodalessandro/ai-sql-engine:latest
     container_name: ai-api
     restart: unless-stopped
     depends_on:
-      postgres-replica:
+      postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
       ollama:
         condition: service_healthy
+    env_file:
+      - .env
     environment:
-      POSTGRES_HOST: ${POSTGRES_HOST:-postgres-replica}
-      POSTGRES_PORT: ${POSTGRES_PORT:-5432}
-      POSTGRES_DB: ${POSTGRES_DB:-ai_database}
-      POSTGRES_USER: ${POSTGRES_USER:-ai_user}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
-      REDIS_HOST: ${REDIS_HOST:-redis}
-      REDIS_PORT: ${REDIS_PORT:-6379}
-      CORS_ORIGINS: ${CORS_ORIGINS:-*}
-      OLLAMA_URL: ${OLLAMA_URL:-http://ollama:11434}
-      OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen:7b}
-      API_KEY: ${API_KEY}
-      RATE_LIMIT: ${RATE_LIMIT:-5}
-      CACHE_TTL: ${CACHE_TTL:-3600}
-      MAX_ROWS: ${MAX_ROWS:-100}
-      MAX_HISTORY: ${MAX_HISTORY:-5}
-      LOG_LEVEL: ${LOG_LEVEL:-INFO}
-      NL_TIMEOUT: ${NL_TIMEOUT:-60}
+      POSTGRES_HOST: postgres
+      POSTGRES_PASSWORD: ai_password
+      REDIS_HOST: redis
+      OLLAMA_URL: http://ollama:11434
+      OLLAMA_MODEL: qwen:7b
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
     ports:
       - "8080:8000"
     networks:
       - ai-network
-    deploy:
-      resources:
-        limits:
-          cpus: '1.0'
-          memory: 512m
 
 networks:
   ai-network:
